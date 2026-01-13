@@ -1,0 +1,8 @@
+# Tahmine Dayalı Dinamik Stok Planlama Sistemi
+# Required dependencies
+
+chronos-forecasting[training]
+torch
+numpy
+pandas
+scipy
