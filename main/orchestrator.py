@@ -25,7 +25,7 @@ class StockPlanningOrchestrator:
     5. Sipariş kararı verme
     """
     
-    def __init__(self, chronos_model_size: str = "base"):
+    def __init__(self, chronos_model_size: str = "tiny"):
         """
         Orkestratörü başlatır.
         
@@ -39,7 +39,10 @@ class StockPlanningOrchestrator:
         # Horizon bazlı hata cache'i
         self.horizon_errors: Dict[str, Dict[int, HorizonError]] = {}
         
-        print("Stok Planlama Sistemi başlatıldı.")
+        # Chronos tahmin geçmişini yükle (hibrit sistem için)
+        self.chronos_history = self.edi_processor.load_chronos_forecasts()
+        
+        print("Stok Planlama Sistemi başlatıldı (Hibrit Mod).")
     
     def load_material_data(
         self,
@@ -102,7 +105,7 @@ class StockPlanningOrchestrator:
         current_week: int
     ) -> StockDecision:
         """
-        Haftalık planlama döngüsünü çalıştırır.
+        Haftalık planlama döngüsünü çalıştırır (Hibrit Sistem).
         
         Args:
             material_id: Malzeme ID
@@ -123,32 +126,111 @@ class StockPlanningOrchestrator:
         historical = self.edi_processor.get_historical_series(material_id, current_week)
         print(f"Geçmiş veri sayısı: {len(historical)}")
         
-        # 2. Lead time için Chronos tahmini
+        # 2. Lead time ve hedef hafta
         lead_time = material.lead_time_weeks
-        print(f"Lead time: {lead_time} hafta")
+        target_week = current_week + lead_time
+        print(f"Lead time: {lead_time} hafta | Hedef hafta: {target_week}")
         
+        # 3. İki tahmini de al
+        chronos_forecast = None
+        edi_forecast = None
+        
+        # Chronos tahmini
         if len(historical) >= 2:
-            # Chronos ile tahmin
-            raw_forecast = self.forecaster.forecast_single_week(historical, lead_time)
-            print(f"Chronos tahmini (ham): {raw_forecast:.2f}")
+            chronos_forecast = self.forecaster.forecast_single_week(historical, lead_time)
+            print(f"Chronos tahmini: {chronos_forecast:.2f}")
+            
+            # Chronos tahminini kaydet
+            self.edi_processor.save_chronos_forecast(
+                material_id=material_id,
+                forecast_week=current_week,
+                target_week=target_week,
+                forecast_value=chronos_forecast
+            )
+            # Hafızayı güncelle
+            self.chronos_history = self.edi_processor.load_chronos_forecasts()
         else:
-            # Yeterli veri yoksa EDI tahminini kullan
-            latest_forecasts = self.edi_processor.get_latest_forecasts(material_id, current_week)
-            target_week = current_week + lead_time
-            raw_forecast = latest_forecasts.get(target_week, 0)
-            print(f"EDI tahmini kullanıldı: {raw_forecast:.2f}")
+            print("Chronos tahmini yapılamadı (yetersiz veri)")
         
-        # 3. Horizon bazlı hata metriklerini al
+        # EDI tahmini (geçmiş tahminlerin ortalaması - tüm geçmiş haftalar)
+        edi_forecast = self.edi_processor.get_edi_average_forecast(
+            material_id, current_week, target_week
+        )
+        if edi_forecast:
+            print(f"EDI tahmini (ortalama): {edi_forecast:.2f}")
+        else:
+            print("EDI tahmini bulunamadı")
+        
+        # 4. Performans karşılaştırması (son 3 hafta)
+        chronos_rmse = self.edi_processor.calculate_source_accuracy(
+            material_id, current_week, "chronos", lookback_weeks=3,
+            chronos_history=self.chronos_history
+        )
+        edi_rmse = self.edi_processor.calculate_source_accuracy(
+            material_id, current_week, "edi", lookback_weeks=3
+        )
+        
+        print(f"\nPerformans Karşılaştırması (Son 3 Hafta RMSE):")
+        print(f"  Chronos: {chronos_rmse:.2f}" if chronos_rmse else "  Chronos: Yeterli veri yok")
+        print(f"  EDI: {edi_rmse:.2f}" if edi_rmse else "  EDI: Yeterli veri yok")
+        
+        # 5. Kaynak seçimi ve final tahmin
+        selected_source = "EDI"
+        raw_forecast = edi_forecast if edi_forecast else 0
+        
+        if chronos_forecast is not None and edi_forecast is not None:
+            if chronos_rmse is not None and edi_rmse is not None:
+                # Her zaman ağırlıklı ortalama al
+                selected_source = "HYBRID"
+                # Ters ağırlıklandırma: Hatası düşük olan daha fazla ağırlık alır
+                w_chronos = 1.0 / (chronos_rmse + 1e-6)
+                w_edi = 1.0 / (edi_rmse + 1e-6)
+                total_weight = w_chronos + w_edi
+                raw_forecast = (chronos_forecast * w_chronos + edi_forecast * w_edi) / total_weight
+                
+                # Performans farkını göster
+                diff_percent = abs(chronos_rmse - edi_rmse) / max(chronos_rmse, edi_rmse)
+                better_source = "Chronos" if chronos_rmse < edi_rmse else "EDI"
+                
+                print(f"-> Karar: HYBRID (agirlikli ortalama) = {raw_forecast:.2f}")
+                print(f"   Agirliklar: Chronos={w_chronos/total_weight:.2%}, EDI={w_edi/total_weight:.2%}")
+                print(f"   En iyi performans: {better_source} (Fark: {diff_percent:.1%})")
+            elif chronos_rmse is not None:
+                selected_source = "CHRONOS"
+                raw_forecast = chronos_forecast
+                print(f"-> Karar: CHRONOS secildi (EDI performansi bilinmiyor)")
+            elif edi_rmse is not None:
+                selected_source = "EDI"
+                raw_forecast = edi_forecast
+                print(f"-> Karar: EDI secildi (Chronos performansi bilinmiyor)")
+            else:
+                # Ilk haftalar: Basit ortalama
+                selected_source = "HYBRID"
+                raw_forecast = (chronos_forecast + edi_forecast) / 2
+                print(f"-> Karar: HYBRID (basit ortalama, performans verileri henuz yok)")
+        elif chronos_forecast is not None:
+            selected_source = "CHRONOS"
+            raw_forecast = chronos_forecast
+            print(f"-> Karar: CHRONOS secildi (EDI tahmini yok)")
+        elif edi_forecast is not None:
+            selected_source = "EDI"
+            raw_forecast = edi_forecast
+            print(f"-> Karar: EDI secildi (Chronos tahmini yok)")
+        else:
+            print(f"-> UYARI: Hicbir tahmin bulunamadi, varsayilan deger kullaniliyor")
+            raw_forecast = 0
+        
+        # 6. Horizon bazlı hata metriklerini al (bias düzeltmesi için)
         horizon_error = self.get_horizon_error(material_id, lead_time)
         if horizon_error:
-            print(f"Horizon {lead_time} hata metrikleri:")
+            print(f"\nHorizon {lead_time} hata metrikleri:")
             print(f"  Bias: {horizon_error.bias:.2f}")
             print(f"  RMSE: {horizon_error.rmse:.2f}")
             print(f"  Std: {horizon_error.std:.2f}")
         else:
-            print("Horizon hata metrikleri bulunamadı, varsayılan değerler kullanılacak.")
+            print("\nHorizon hata metrikleri bulunamadı, varsayılan değerler kullanılacak.")
         
-        # 4. Stok kararı oluştur
+        # 7. Stok kararı oluştur
         decision = self.stock_calculator.make_stock_decision(
             material=material,
             current_week=current_week,
@@ -156,7 +238,12 @@ class StockPlanningOrchestrator:
             horizon_error=horizon_error
         )
         
-        # 5. Sonuçları yazdır
+        # Hibrit sistem bilgilerini ekle
+        decision.selected_source = selected_source
+        decision.chronos_raw_forecast = chronos_forecast
+        decision.edi_raw_forecast = edi_forecast
+        
+        # 8. Sonuçları yazdır
         print(f"\n{decision}")
         
         return decision

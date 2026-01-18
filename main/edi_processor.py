@@ -5,8 +5,10 @@ Haftalık EDI tahminlerini işler ve analiz eder
 
 import pandas as pd
 import numpy as np
+import json
+import os
 from typing import Dict, List, Optional, Tuple
-from models import EDIForecast, ActualConsumption, MaterialData
+from models import EDIForecast, ActualConsumption, MaterialData, ChronosForecastLog
 
 
 class EDIProcessor:
@@ -218,3 +220,227 @@ class EDIProcessor:
                 }
         
         return results
+    
+    def save_chronos_forecast(
+        self,
+        material_id: str,
+        forecast_week: int,
+        target_week: int,
+        forecast_value: float,
+        filepath: str = "chronos_forecasts.json"
+    ):
+        """
+        Chronos tahminini JSON dosyasına kaydeder.
+        
+        Args:
+            material_id: Malzeme ID
+            forecast_week: Tahminin yapıldığı hafta
+            target_week: Tahmin edilen hafta
+            forecast_value: Tahmin değeri
+            filepath: JSON dosya yolu
+        """
+        # Mevcut verileri yükle
+        data = {}
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except:
+                data = {}
+        
+        # Yeni tahmini ekle
+        if material_id not in data:
+            data[material_id] = []
+        
+        log_entry = {
+            'forecast_week': forecast_week,
+            'target_week': target_week,
+            'forecast_value': forecast_value,
+            'timestamp': ChronosForecastLog(
+                material_id=material_id,
+                forecast_week=forecast_week,
+                target_week=target_week,
+                forecast_value=forecast_value
+            ).timestamp
+        }
+        
+        data[material_id].append(log_entry)
+        
+        # Dosyaya kaydet
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    def load_chronos_forecasts(
+        self,
+        filepath: str = "chronos_forecasts.json"
+    ) -> Dict[str, List[ChronosForecastLog]]:
+        """
+        Chronos tahmin geçmişini JSON dosyasından yükler.
+        
+        Args:
+            filepath: JSON dosya yolu
+            
+        Returns:
+            {material_id: [ChronosForecastLog, ...]}
+        """
+        if not os.path.exists(filepath):
+            return {}
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            result = {}
+            for material_id, logs in data.items():
+                result[material_id] = [
+                    ChronosForecastLog(
+                        material_id=material_id,
+                        forecast_week=log['forecast_week'],
+                        target_week=log['target_week'],
+                        forecast_value=log['forecast_value'],
+                        timestamp=log.get('timestamp', '')
+                    )
+                    for log in logs
+                ]
+            
+            return result
+        except:
+            return {}
+    
+    def get_edi_average_forecast(
+        self,
+        material_id: str,
+        current_week: int,
+        target_week: int,
+        lookback_weeks: Optional[int] = None
+    ) -> Optional[float]:
+        """
+        Hedef hafta için geçmişte yapılmış EDI tahminlerinin ortalamasını döner.
+        
+        Args:
+            material_id: Malzeme ID
+            current_week: Mevcut hafta
+            target_week: Hedef hafta
+            lookback_weeks: Kaç hafta geriye bakılacak (None ise current_week kadar geri gider)
+            
+        Returns:
+            EDI tahminlerinin ortalaması (veya None)
+        """
+        material = self.materials.get(material_id)
+        if not material:
+            return None
+        
+        # lookback_weeks belirtilmemişse, current_week kadar geri git (tüm geçmiş)
+        if lookback_weeks is None:
+            lookback_weeks = current_week
+        
+        matrix = material.get_forecast_matrix()
+        
+        # Geçmiş haftalardaki tahminleri topla (Hafta 1'den current_week'e kadar)
+        forecasts = []
+        for week in range(max(1, current_week - lookback_weeks), current_week + 1):
+            if week in matrix and target_week in matrix[week]:
+                forecasts.append(matrix[week][target_week])
+        
+        if not forecasts:
+            # Hiç tahmin yoksa, en son bulunan tahmini kullan
+            for week in range(current_week, 0, -1):
+                if week in matrix and target_week in matrix[week]:
+                    return matrix[week][target_week]
+            return None
+        
+        # Ortalama al
+        return float(np.mean(forecasts))
+    
+    def calculate_source_accuracy(
+        self,
+        material_id: str,
+        current_week: int,
+        source: str,
+        lookback_weeks: int = 3,
+        chronos_history: Optional[Dict[str, List[ChronosForecastLog]]] = None
+    ) -> Optional[float]:
+        """
+        Belirli bir kaynak icin son N haftanin RMSE'sini hesaplar.
+        
+        ONEMLI: Sadece current_week'ten ONCEKI gerceklesmis veriler kullanilir!
+        Target_week >= current_week olan tahminler degerlendirilemez.
+        
+        CHRONOS icin:
+            - Son 3 haftada (current_week - 3, current_week - 2, current_week - 1) yapilan tahminler
+            - Sadece target_week < current_week olan tahminler
+        
+        EDI icin:
+            - Son 3 haftanin gerceklesenleri (current_week - 3, current_week - 2, current_week - 1)
+            - Her hafta icin o haftaya yapilan son 2 tahmin (horizon-1 ve horizon-2)
+        
+        Args:
+            material_id: Malzeme ID
+            current_week: Mevcut hafta
+            source: "chronos" veya "edi"
+            lookback_weeks: Kac hafta geriye bakilacak
+            chronos_history: Chronos tahmin gecmisi (source="chronos" icin gerekli)
+            
+        Returns:
+            RMSE degeri (veya None)
+        """
+        material = self.materials.get(material_id)
+        if not material:
+            return None
+        
+        actuals = material.get_actuals_dict()
+        errors = []
+        
+        if source == "chronos":
+            # CHRONOS: Son N haftanin gerceklesenleri icin Chronos tahminlerini degerlendir
+            # EDI ile ayni mantik: target_week bazli bakilir
+            if not chronos_history or material_id not in chronos_history:
+                return None
+            
+            logs = chronos_history[material_id]
+            
+            # Son N haftanin gerceklesen degerlerini al (current_week'ten once)
+            for target_week in range(max(1, current_week - lookback_weeks), current_week):
+                if target_week not in actuals:
+                    continue
+                
+                actual_value = actuals[target_week]
+                
+                # Bu haftaya yapilmis Chronos tahminlerini bul
+                target_forecasts = [log for log in logs 
+                                   if log.target_week == target_week and log.forecast_week < target_week]
+                
+                for log in target_forecasts:
+                    error = log.forecast_value - actual_value
+                    errors.append(error)
+        
+        elif source == "edi":
+            # EDI: Son N haftanin gerceklesenleri icin, her birine yapilan 2 tahmini degerlendir
+            matrix = material.get_forecast_matrix()
+            
+            # Son N haftanin gerceklesen degerlerini al
+            for target_week in range(max(1, current_week - lookback_weeks), current_week):
+                if target_week not in actuals:
+                    continue
+                
+                actual_value = actuals[target_week]
+                
+                # Bu haftaya yapilan son 2 tahmini bul (horizon-1 ve horizon-2)
+                # Horizon-1: target_week - 1'den yapilan tahmin
+                # Horizon-2: target_week - 2'den yapilan tahmin
+                for horizon in [1, 2]:
+                    forecast_week = target_week - horizon
+                    if forecast_week >= 1 and forecast_week in matrix:
+                        if target_week in matrix[forecast_week]:
+                            forecast = matrix[forecast_week][target_week]
+                            error = forecast - actual_value
+                            errors.append(error)
+        
+        if len(errors) < 1:
+            return None
+        
+        # RMSE hesapla (en az 1 veri noktasi yeterli)
+        errors_arr = np.array(errors)
+        rmse = float(np.sqrt(np.mean(errors_arr ** 2)))
+        
+        return rmse

@@ -4,7 +4,6 @@ Ana giriş noktası
 """
 
 from orchestrator import StockPlanningOrchestrator
-from demo import generate_sample_edi_data, run_demo
 
 
 def main():
@@ -42,14 +41,9 @@ def main():
     )
     
     parser.add_argument(
-        '--demo',
-        action='store_true',
-        help='Demo modunda çalıştır (örnek verilerle)'
-    )
-    
-    parser.add_argument(
         '--data',
         type=str,
+        required=True,
         help='EDI veri dosyası yolu (CSV)'
     )
     
@@ -98,32 +92,24 @@ def main():
     
     args = parser.parse_args()
     
-    if args.demo:
-        run_demo()
-    elif args.data:
-        # Gerçek veri ile çalıştır
-        print("Sistem başlatılıyor...")
-        orchestrator = StockPlanningOrchestrator(chronos_model_size=args.model_size)
-        
-        print(f"Veri yükleniyor: {args.data}")
-        orchestrator.load_material_data(
-            filepath=args.data,
-            material_id=args.material_id,
-            lead_time_weeks=args.lead_time,
-            current_stock=args.current_stock,
-            service_level=args.service_level
-        )
-        
-        print(f"\nHafta {args.current_week} için planlama yapılıyor...")
-        decision = orchestrator.run_weekly_planning(
-            args.material_id,
-            current_week=args.current_week
-        )
-    else:
-        parser.print_help()
-        print("\nÖrnek kullanım:")
-        print("  python main.py --demo")
-        print("  python main.py --data veri.csv --current-week 10")
+    # Veri ile çalıştır
+    print("Sistem başlatılıyor...")
+    orchestrator = StockPlanningOrchestrator(chronos_model_size=args.model_size)
+    
+    print(f"Veri yükleniyor: {args.data}")
+    orchestrator.load_material_data(
+        filepath=args.data,
+        material_id=args.material_id,
+        lead_time_weeks=args.lead_time,
+        current_stock=args.current_stock,
+        service_level=args.service_level
+    )
+    
+    print(f"\nHafta {args.current_week} için planlama yapılıyor...")
+    decision = orchestrator.run_weekly_planning(
+        args.material_id,
+        current_week=args.current_week
+    )
 
 
 if __name__ == "__main__":

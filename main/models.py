@@ -5,7 +5,7 @@ Data models and structures for the Dynamic Stock Planning System
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from datetime import date
+from datetime import date, datetime
 import numpy as np
 
 
@@ -69,6 +69,21 @@ class HorizonError:
 
 
 @dataclass
+class ChronosForecastLog:
+    """Chronos tahmin geçmişi kaydı"""
+    material_id: str
+    forecast_week: int
+    target_week: int
+    forecast_value: float
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    @property
+    def horizon(self) -> int:
+        """Tahmin horizonu (kaç hafta ileri)"""
+        return self.target_week - self.forecast_week
+
+
+@dataclass
 class StockDecision:
     """Stok kararı sonucu"""
     material_id: str
@@ -96,6 +111,11 @@ class StockDecision:
     z_score: float = 1.645  # %95 için varsayılan Z değeri
     actual_target_week: Optional[float] = None  # Hedef haftanın gerçek değeri (eğer varsa)
     
+    # Hibrit sistem bilgileri
+    selected_source: str = "EDI"  # Seçilen tahmin kaynağı: "CHRONOS", "EDI", "HYBRID"
+    chronos_raw_forecast: Optional[float] = None  # Chronos'un ham tahmini
+    edi_raw_forecast: Optional[float] = None  # EDI'nin ham tahmini
+    
     def __str__(self) -> str:
         status = "SİPARİŞ VER" if self.should_order else "SİPARİŞ YOK"
         
@@ -106,9 +126,15 @@ class StockDecision:
         else:
             target_week_info += " | Gerçek Değer: Henüz Bilinmiyor"
         
+        # Kaynak bilgisi
+        source_info = f"Seçilen Kaynak: {self.selected_source}"
+        if self.chronos_raw_forecast is not None and self.edi_raw_forecast is not None:
+            source_info += f" | Chronos: {self.chronos_raw_forecast:.2f}, EDI: {self.edi_raw_forecast:.2f}"
+        
         return (
             f"Malzeme: {self.material_id} | Hafta: {self.current_week}\n"
             f"{target_week_info}\n"
+            f"{source_info}\n"
             f"Ham Tahmin: {self.raw_forecast:.2f} | Düzeltilmiş: {self.bias_corrected_forecast:.2f}\n"
             f"Emniyet Stoğu: {self.safety_stock:.2f}\n"
             f"Reorder Point: {self.reorder_point:.2f}\n"

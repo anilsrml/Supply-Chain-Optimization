@@ -12,7 +12,7 @@ from chronos import ChronosPipeline
 class ChronosForecaster:
     """Chronos model ile talep tahmini yapan sınıf"""
     
-    def __init__(self, model_size: str = "base"):
+    def __init__(self, model_size: str = "tiny"):
         """
         Chronos modelini başlatır.
         

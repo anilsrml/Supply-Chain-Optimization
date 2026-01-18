@@ -1,3 +1,10 @@
 *.xlsx
 *.xls
 *.csv
+*.md
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+.env
+chronos_forecasts.json
