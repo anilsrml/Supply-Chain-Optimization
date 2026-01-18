@@ -2,7 +2,7 @@
 
 Bu proje, Chronos kullanarak tahmine dayalı dinamik stok planlaması yapar.
 
-## 🚀 Hızlı Başlangıç
+##  Hızlı Başlangıç
 
 ### 1. Gereksinimleri Yükleyin
 Terminalinizi açın ve aşağıdaki komutu çalıştırarak gerekli kütüphaneleri yükleyin:
@@ -18,7 +18,7 @@ Ana simülasyonu başlatmak için:
 python main/main.py
 ```
 
-## 📋 Notlar
+##  Notlar
 - Veriler `main/data.csv` dosyasından okunur.
 - Sonuçlar `main/forecast_results.xlsx` olarak kaydedilir.
 - Chronos modeli ilk çalışmada gerekli ağırlıkları otomatik olarak indirecektir.
