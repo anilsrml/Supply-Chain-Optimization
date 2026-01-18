@@ -1,7 +1,6 @@
 *.xlsx
 *.xls
 *.csv
-*.md
 __pycache__/
 *.pyc
 .vscode/
