@@ -3,7 +3,50 @@ Tahmine Dayalı Dinamik Stok Planlama Sistemi
 Ana giriş noktası
 """
 
+import os
 from orchestrator import StockPlanningOrchestrator
+
+
+def ensure_chronos_forecasts_exist(data_filepath: str, material_id: str, max_week: int = 13):
+    """
+    Chronos tahminlerinin JSON dosyasında olduğundan emin olur.
+    Yoksa otomatik olarak üretir.
+    
+    Args:
+        data_filepath: CSV veri dosyası
+        material_id: Malzeme ID
+        max_week: Maksimum hafta sayısı
+    """
+    forecast_file = "chronos_forecasts.json"
+    
+    # JSON dosyası varsa ve içinde veri varsa, tekrar üretme
+    if os.path.exists(forecast_file):
+        import json
+        try:
+            with open(forecast_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if material_id in data and len(data[material_id]) > 0:
+                    print(f"✓ Chronos tahminleri zaten mevcut ({len(data[material_id])} kayıt)")
+                    return
+        except:
+            pass
+    
+    # JSON yoksa veya boşsa, test dosyasını çalıştır
+    print("⚠ Chronos tahminleri bulunamadı, üretiliyor...")
+    try:
+        from test_chronos_data_generator import generate_all_chronos_forecasts
+        generate_all_chronos_forecasts(
+            data_filepath=data_filepath,
+            material_id=material_id,
+            output_filepath=forecast_file,
+            max_week=max_week,
+            max_lead_time=5,
+            force_regenerate=False
+        )
+        print("✓ Chronos tahminleri başarıyla üretildi")
+    except Exception as e:
+        print(f"⚠ Chronos tahminleri üretilemedi: {str(e)}")
+        print("  Sistem EDI tahminleri ile devam edecek")
 
 
 def main():
@@ -90,10 +133,24 @@ def main():
         help='Chronos model boyutu (varsayılan: tiny)'
     )
     
+    parser.add_argument(
+        '--skip-chronos-check',
+        action='store_true',
+        help='Chronos tahmin kontrolünü atla (hızlı test için)'
+    )
+    
     args = parser.parse_args()
     
+    # Chronos tahminlerini kontrol et ve gerekirse üret
+    if not args.skip_chronos_check:
+        ensure_chronos_forecasts_exist(
+            data_filepath=args.data,
+            material_id=args.material_id,
+            max_week=13
+        )
+    
     # Veri ile çalıştır
-    print("Sistem başlatılıyor...")
+    print("\nSistem başlatılıyor...")
     orchestrator = StockPlanningOrchestrator(chronos_model_size=args.model_size)
     
     print(f"Veri yükleniyor: {args.data}")

@@ -45,6 +45,7 @@ class EDIProcessor:
         actual_consumptions = []
         
         # DataFrame'i işle
+        zero_count = 0
         for forecast_week in df.index:
             for target_week in df.columns:
                 try:
@@ -52,7 +53,13 @@ class EDIProcessor:
                     tw = int(target_week)
                     value = df.loc[forecast_week, target_week]
                     
+                    # NaN değerleri atla
                     if pd.isna(value):
+                        continue
+                    
+                    # SIFIR MASKELEME: 0 değerleri veri olarak kabul etme
+                    if float(value) == 0:
+                        zero_count += 1
                         continue
                     
                     # Üst üçgen: Tahminler (target_week > forecast_week)
@@ -70,6 +77,10 @@ class EDIProcessor:
                         ))
                 except (ValueError, TypeError):
                     continue
+        
+        # Sıfır maskeleme logu
+        if zero_count > 0:
+            print(f"UYARI [{material_id}]: {zero_count} adet sıfır değer tespit edildi ve maskelendi.")
         
         material = MaterialData(
             material_id=material_id,
@@ -100,7 +111,8 @@ class EDIProcessor:
     def get_historical_series(
         self,
         material_id: str,
-        up_to_week: Optional[int] = None
+        up_to_week: Optional[int] = None,
+        exclude_zeros: bool = True
     ) -> List[float]:
         """
         Belirli bir haftaya kadar gerçekleşen tüketim serisini döner.
@@ -108,9 +120,10 @@ class EDIProcessor:
         Args:
             material_id: Malzeme ID
             up_to_week: Bu haftaya kadar (dahil)
+            exclude_zeros: True ise sıfır değerler maskelenir (varsayılan)
             
         Returns:
-            Kronolojik sırayla tüketim listesi
+            Kronolojik sırayla tüketim listesi (sıfırlar hariç)
         """
         material = self.materials.get(material_id)
         if not material:
@@ -120,6 +133,14 @@ class EDIProcessor:
         
         if up_to_week:
             actuals = {k: v for k, v in actuals.items() if k <= up_to_week}
+        
+        # SIFIR MASKELEME: Sıfır değerleri filtrele
+        if exclude_zeros:
+            original_count = len(actuals)
+            actuals = {k: v for k, v in actuals.items() if v != 0}
+            zero_count = original_count - len(actuals)
+            if zero_count > 0:
+                print(f"UYARI [{material_id}]: {zero_count} adet sıfır gerçekleşen değer maskelendi.")
         
         # Kronolojik sırala
         sorted_weeks = sorted(actuals.keys())
@@ -202,9 +223,17 @@ class EDIProcessor:
                 if horizon < 1 or horizon > max_horizon:
                     continue
                 
+                # SIFIR MASKELEME: Tahmin sıfırsa atla
+                if forecast_qty == 0:
+                    continue
+                
                 # Gerçekleşen değer var mı?
                 if target_week in actuals:
-                    error = forecast_qty - actuals[target_week]
+                    actual_qty = actuals[target_week]
+                    # SIFIR MASKELEME: Gerçekleşen sıfırsa atla
+                    if actual_qty == 0:
+                        continue
+                    error = forecast_qty - actual_qty
                     horizon_errors[horizon].append(error)
         
         # Metrikleri hesapla
@@ -312,7 +341,9 @@ class EDIProcessor:
         material_id: str,
         current_week: int,
         target_week: int,
-        lookback_weeks: Optional[int] = None
+        lookback_weeks: Optional[int] = None,
+        method: str = "iqr_mean",
+        use_weighted: bool = False
     ) -> Optional[float]:
         """
         Hedef hafta için geçmişte yapılmış EDI tahminlerinin ortalamasını döner.
@@ -322,9 +353,15 @@ class EDIProcessor:
             current_week: Mevcut hafta
             target_week: Hedef hafta
             lookback_weeks: Kaç hafta geriye bakılacak (None ise current_week kadar geri gider)
+            method: Hesaplama yöntemi
+                - "simple": Basit ortalama
+                - "median": Medyan (aykırı değerlere karşı dayanıklı)
+                - "iqr_mean": IQR ile aykırı değerleri temizle, sonra ortalama (varsayılan)
+                - "iqr_median": IQR ile aykırı değerleri temizle, sonra medyan
+            use_weighted: True ise son tahminlere daha fazla ağırlık verir
             
         Returns:
-            EDI tahminlerinin ortalaması (veya None)
+            EDI tahminlerinin hesaplanmış değeri (veya None)
         """
         material = self.materials.get(material_id)
         if not material:
@@ -338,19 +375,88 @@ class EDIProcessor:
         
         # Geçmiş haftalardaki tahminleri topla (Hafta 1'den current_week'e kadar)
         forecasts = []
+        zero_count = 0
         for week in range(max(1, current_week - lookback_weeks), current_week + 1):
             if week in matrix and target_week in matrix[week]:
-                forecasts.append(matrix[week][target_week])
+                value = matrix[week][target_week]
+                # SIFIR MASKELEME: 0 değerleri hesaba katma
+                if value == 0:
+                    zero_count += 1
+                    continue
+                forecasts.append(value)
         
         if not forecasts:
-            # Hiç tahmin yoksa, en son bulunan tahmini kullan
+            # Hiç tahmin yoksa, en son bulunan tahmini kullan (sıfır olmayanlardan)
             for week in range(current_week, 0, -1):
                 if week in matrix and target_week in matrix[week]:
-                    return matrix[week][target_week]
+                    value = matrix[week][target_week]
+                    if value != 0:
+                        return value
+            # Tüm değerler sıfırsa veya hiç veri yoksa
+            if zero_count > 0:
+                print(f"UYARI [{material_id}]: Hedef hafta {target_week} için tüm EDI tahminleri sıfır. 'Veri Yok' döndürülüyor.")
             return None
         
-        # Ortalama al
+        # Aykırı değer temizleme (IQR yöntemi)
+        if method in ["iqr_mean", "iqr_median"]:
+            forecasts = self._remove_outliers_iqr(forecasts)
+            
+            # Temizleme sonrası veri kalmadıysa, orijinal verinin medyanını kullan
+            if not forecasts:
+                return float(np.median(forecasts))
+        
+        # Hesaplama yöntemi seçimi
+        if method in ["median", "iqr_median"]:
+            return float(np.median(forecasts))
+        
+        # Ortalama hesaplama (weighted veya simple)
+        if use_weighted and len(forecasts) > 1:
+            # Son tahminlere doğru lineer artan ağırlık
+            weights = np.arange(1, len(forecasts) + 1)
+            return float(np.average(forecasts, weights=weights))
+        
+        # Basit ortalama (varsayılan)
         return float(np.mean(forecasts))
+    
+    def _remove_outliers_iqr(
+        self,
+        data: List[float],
+        iqr_multiplier: float = 1.5
+    ) -> List[float]:
+        """
+        IQR (Interquartile Range) yöntemiyle aykırı değerleri temizler.
+        
+        Args:
+            data: Veri listesi
+            iqr_multiplier: IQR çarpanı (varsayılan 1.5, standart değer)
+            
+        Returns:
+            Aykırı değerlerden temizlenmiş veri listesi
+        """
+        if len(data) < 4:  # IQR hesabı için en az 4 veri noktası gerekli
+            return data
+        
+        data_arr = np.array(data)
+        
+        # Q1 (25. persentil) ve Q3 (75. persentil) hesapla
+        q1 = np.percentile(data_arr, 25)
+        q3 = np.percentile(data_arr, 75)
+        
+        # IQR hesapla
+        iqr = q3 - q1
+        
+        # Alt ve üst sınırları belirle
+        lower_bound = q1 - iqr_multiplier * iqr
+        upper_bound = q3 + iqr_multiplier * iqr
+        
+        # Aykırı olmayan değerleri filtrele
+        filtered_data = [x for x in data if lower_bound <= x <= upper_bound]
+        
+        # Eğer tüm veriler temizlendiyse, orijinal veriyi döndür
+        if not filtered_data:
+            return data
+        
+        return filtered_data
     
     def calculate_source_accuracy(
         self,
@@ -405,12 +511,18 @@ class EDIProcessor:
                     continue
                 
                 actual_value = actuals[target_week]
+                # SIFIR MASKELEME: Gerçekleşen sıfırsa atla
+                if actual_value == 0:
+                    continue
                 
                 # Bu haftaya yapilmis Chronos tahminlerini bul
                 target_forecasts = [log for log in logs 
                                    if log.target_week == target_week and log.forecast_week < target_week]
                 
                 for log in target_forecasts:
+                    # SIFIR MASKELEME: Tahmin sıfırsa atla
+                    if log.forecast_value == 0:
+                        continue
                     error = log.forecast_value - actual_value
                     errors.append(error)
         
@@ -424,6 +536,9 @@ class EDIProcessor:
                     continue
                 
                 actual_value = actuals[target_week]
+                # SIFIR MASKELEME: Gerçekleşen sıfırsa atla
+                if actual_value == 0:
+                    continue
                 
                 # Bu haftaya yapilan son 2 tahmini bul (horizon-1 ve horizon-2)
                 # Horizon-1: target_week - 1'den yapilan tahmin
@@ -433,6 +548,9 @@ class EDIProcessor:
                     if forecast_week >= 1 and forecast_week in matrix:
                         if target_week in matrix[forecast_week]:
                             forecast = matrix[forecast_week][target_week]
+                            # SIFIR MASKELEME: Tahmin sıfırsa atla
+                            if forecast == 0:
+                                continue
                             error = forecast - actual_value
                             errors.append(error)
         
