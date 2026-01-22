@@ -16,7 +16,7 @@ Bu proje, **gerçek zamanlı Chronos tahminleri** kullanarak tahmine dayalı din
 - **Performans Metriği**: Son 3 hafta RMSE bazlı kaynak seçimi
 - **Bias Düzeltme**: Horizon bazlı sistematik hata düzeltmesi
 
-## 🚀 Hızlı Başlangıç
+##  Hızlı Başlangıç
 
 ### 1. Gereksinimleri Yükleyin
 Terminalinizi açın ve aşağıdaki komutu çalıştırarak gerekli kütüphaneleri yükleyin:
