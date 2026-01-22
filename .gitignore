@@ -1,9 +1,9 @@
 *.xlsx
 *.xls
 *.csv
+*.json
 __pycache__/
 *.pyc
 .vscode/
 .idea/
 .env
-chronos_forecasts.json

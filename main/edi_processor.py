@@ -198,10 +198,19 @@ class EDIProcessor:
     def calculate_forecast_errors(
         self,
         material_id: str,
-        max_horizon: int = 12
+        max_horizon: int = 12,
+        current_week: Optional[int] = None
     ) -> Dict[int, Dict[str, float]]:
         """
         Her horizon için tahmin hatalarını hesaplar.
+        
+        ÖNEMLİ: Look-ahead bias'ı engellemek için sadece current_week'e kadar
+        olan gerçekleşen veriler kullanılır!
+        
+        Args:
+            material_id: Malzeme ID
+            max_horizon: Maksimum horizon değeri
+            current_week: Mevcut hafta (None ise tüm veriler kullanılır)
         
         Returns:
             {horizon: {'bias': float, 'rmse': float, 'std': float, 'count': int}}
@@ -221,6 +230,11 @@ class EDIProcessor:
                 horizon = target_week - forecast_week
                 
                 if horizon < 1 or horizon > max_horizon:
+                    continue
+                
+                # LOOK-AHEAD BIAS ENGELLENİYOR:
+                # Current week belirtilmişse, sadece o haftaya kadar olan gerçekleşenleri kullan
+                if current_week is not None and target_week > current_week:
                     continue
                 
                 # SIFIR MASKELEME: Tahmin sıfırsa atla

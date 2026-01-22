@@ -15,14 +15,19 @@ from stock_calculator import StockCalculator
 
 class StockPlanningOrchestrator:
     """
-    Dinamik Stok Planlama Sistemi Orkestratörü
+    Dinamik Stok Planlama Sistemi Orkestratörü (Gerçek Zamanlı Chronos)
     
-    Haftalık çalışma akışı:
-    1. Chronos ile ileri haftalar için talep tahmini
-    2. Geçmiş verilerle horizon bazlı bias ve hata ölçüleri güncelleme
-    3. Lead time'a denk gelen haftanın talebini düzeltme
-    4. Emniyet stoğu ve reorder point hesaplama
-    5. Sipariş kararı verme
+    Haftalık çalışma akışı (Rolling Forecast):
+    1. Geçmiş veriyi kullanarak Chronos ile gerçek zamanlı tahmin
+    2. EDI tahminlerini geçmişten topla ve hesapla
+    3. Her iki kaynağın performansını değerlendir (son 3 hafta RMSE)
+    4. Hibrit tahmin oluştur (performansa göre ağırlıklı ortalama)
+    5. Horizon bazlı bias düzeltmesi uygula
+    6. Emniyet stoğu ve reorder point hesapla
+    7. Sipariş kararı ver
+    
+    ÖNEMLİ: Sadece mevcut haftaya kadar olan geçmiş veri kullanılır.
+    Gelecek bilgisi sızması (look-ahead bias) engellenir.
     """
     
     def __init__(self, chronos_model_size: str = "tiny"):
@@ -39,10 +44,12 @@ class StockPlanningOrchestrator:
         # Horizon bazlı hata cache'i
         self.horizon_errors: Dict[str, Dict[int, HorizonError]] = {}
         
-        # Chronos tahmin geçmişini yükle (hibrit sistem için)
+        # Chronos tahmin geçmişini yükle
+        # Not: Bu geçmiş, gerçek zamanlı yapılan tahminlerin kayıtlarını içerir
+        # Performans karşılaştırması için kullanılır
         self.chronos_history = self.edi_processor.load_chronos_forecasts()
         
-        print("Stok Planlama Sistemi başlatıldı (Hibrit Mod).")
+        print("Stok Planlama Sistemi başlatıldı (Gerçek Zamanlı Chronos - Hibrit Mod).")
     
     def load_material_data(
         self,
@@ -62,9 +69,18 @@ class StockPlanningOrchestrator:
         
         return material
     
-    def _update_horizon_errors(self, material_id: str):
-        """Horizon bazlı hataları günceller"""
-        error_dict = self.edi_processor.calculate_forecast_errors(material_id)
+    def _update_horizon_errors(self, material_id: str, current_week: Optional[int] = None):
+        """
+        Horizon bazlı hataları günceller.
+        
+        Args:
+            material_id: Malzeme ID
+            current_week: Mevcut hafta (None ise tüm veriler kullanılır)
+        """
+        error_dict = self.edi_processor.calculate_forecast_errors(
+            material_id, 
+            current_week=current_week
+        )
         
         self.horizon_errors[material_id] = {}
         for horizon, metrics in error_dict.items():
@@ -99,13 +115,100 @@ class StockPlanningOrchestrator:
         closest = min(available_horizons, key=lambda h: abs(h - horizon))
         return material_errors[closest]
     
+    def backfill_chronos_forecasts(
+        self,
+        material_id: str,
+        current_week: int
+    ):
+        """
+        Geçmiş haftalar için geriye dönük Chronos tahminleri üretir.
+        
+        ÖNEMLİ: 
+        - Chronos HER ZAMAN sadece 1 hafta sonrasını tahmin eder
+        - Lead_time'dan bağımsız olarak horizon=1 kullanılır
+        - Look-ahead bias engellenir! Her hafta için sadece o haftaya kadar olan geçmiş veri kullanılır
+        
+        Örnek (current_week=4):
+        - Hafta 1 verisi ile → Hafta 2 tahmini (horizon=1)
+        - Hafta 1-2 verisi ile → Hafta 3 tahmini (horizon=1)
+        - Hafta 1-2-3 verisi ile → Hafta 4 tahmini (horizon=1)
+        
+        Args:
+            material_id: Malzeme ID
+            current_week: Mevcut hafta
+        """
+        print(f"\n[BACKFILL] Gecmis haftalar icin Chronos tahminleri uretiliyor (horizon=1)...")
+        
+        backfilled_count = 0
+        skipped_count = 0
+        
+        # Hafta 1'den current_week'e kadar tüm geçmiş haftalar için tahmin yap
+        # Her zaman 1 sonraki haftayı tahmin et
+        for forecast_week in range(1, current_week):
+            target_week = forecast_week + 1  # HER ZAMAN +1 (horizon=1)
+            
+            # Hedef hafta current_week'i geçemez (gelecek bilgisi kullanılmaz)
+            if target_week > current_week:
+                break
+            
+            # Bu tahmin zaten var mı kontrol et
+            existing_forecasts = self.chronos_history.get(material_id, [])
+            already_exists = any(
+                log.forecast_week == forecast_week and log.target_week == target_week
+                for log in existing_forecasts
+            )
+            
+            if already_exists:
+                skipped_count += 1
+                continue
+            
+            # Geçmiş veriyi al (sadece forecast_week'e kadar)
+            historical = self.edi_processor.get_historical_series(material_id, forecast_week)
+            
+            # En az 2 veri noktası gerekli
+            if len(historical) < 2:
+                continue
+            
+            try:
+                # Chronos tahmini yap - HER ZAMAN horizon=1
+                forecast_value = self.forecaster.forecast_single_week(historical, target_horizon=1)
+                
+                # Kaydet
+                self.edi_processor.save_chronos_forecast(
+                    material_id=material_id,
+                    forecast_week=forecast_week,
+                    target_week=target_week,
+                    forecast_value=forecast_value
+                )
+                
+                backfilled_count += 1
+                print(f"  [+] Hafta {forecast_week} -> Hafta {target_week}: {forecast_value:.2f} (horizon=1)")
+                
+            except Exception as e:
+                print(f"  [!] Hafta {forecast_week} -> Hafta {target_week}: HATA - {str(e)}")
+        
+        # Hafızayı güncelle
+        if backfilled_count > 0:
+            self.chronos_history = self.edi_processor.load_chronos_forecasts()
+            print(f"\n[BACKFILL] Tamamlandı: {backfilled_count} yeni, {skipped_count} mevcut tahmin")
+        else:
+            print(f"[BACKFILL] Tüm geçmiş tahminler zaten mevcut ({skipped_count} tahmin)")
+    
     def run_weekly_planning(
         self,
         material_id: str,
         current_week: int
     ) -> StockDecision:
         """
-        Haftalık planlama döngüsünü çalıştırır (Hibrit Sistem).
+        Haftalık planlama döngüsünü çalıştırır (Gerçek Zamanlı Hibrit Sistem).
+        
+        ÇALIŞMA MANTĞI:
+        1. Geçmiş haftalar için geriye dönük tahminler üret (backfill)
+        2. Sadece current_week'e kadar olan geçmiş veri kullanılır
+        3. Chronos gerçek zamanlı olarak tahmin yapar
+        4. EDI tahminleri geçmişten toplanır
+        5. Her iki kaynağın performansı değerlendirilir (backfill sayesinde yeterli veri)
+        6. Performansa göre ağırlıklı hibrit tahmin oluşturulur
         
         Args:
             material_id: Malzeme ID
@@ -122,9 +225,12 @@ class StockPlanningOrchestrator:
         print(f"Haftalık Planlama - Malzeme: {material_id} | Hafta: {current_week}")
         print(f"{'='*60}")
         
+        # 0. Geçmiş haftalar için geriye dönük tahminler üret (ilk çalıştırmada)
+        self.backfill_chronos_forecasts(material_id, current_week)
+        
         # 1. Geçmiş tüketim serisini al
         historical = self.edi_processor.get_historical_series(material_id, current_week)
-        print(f"Geçmiş veri sayısı: {len(historical)}")
+        print(f"\nGecmis veri sayisi: {len(historical)}")
         
         # 2. Lead time ve hedef hafta
         lead_time = material.lead_time_weeks
@@ -135,16 +241,19 @@ class StockPlanningOrchestrator:
         chronos_forecast = None
         edi_forecast = None
         
-        # Chronos tahmini
+        # Chronos tahmini - HER ZAMAN sadece 1 hafta sonrasini tahmin eder
         if len(historical) >= 2:
-            chronos_forecast = self.forecaster.forecast_single_week(historical, lead_time)
-            print(f"Chronos tahmini: {chronos_forecast:.2f}")
+            # Chronos her zaman horizon=1 kullanir (lead_time'dan bagimsiz)
+            next_week_forecast = self.forecaster.forecast_single_week(historical, target_horizon=1)
+            chronos_forecast = next_week_forecast
+            print(f"Chronos tahmini (1 hafta sonrasi): {chronos_forecast:.2f}")
             
             # Chronos tahminini kaydet
+            # Not: Chronos current_week+1 için tahmin yapar (horizon=1)
             self.edi_processor.save_chronos_forecast(
                 material_id=material_id,
                 forecast_week=current_week,
-                target_week=target_week,
+                target_week=current_week + 1,  # Chronos her zaman 1 hafta sonrasi
                 forecast_value=chronos_forecast
             )
             # Hafızayı güncelle
@@ -221,6 +330,9 @@ class StockPlanningOrchestrator:
             raw_forecast = 0
         
         # 6. Horizon bazlı hata metriklerini al (bias düzeltmesi için)
+        # ÖNEMLİ: Bias hesaplamasını current_week ile sınırla (look-ahead bias engellenir)
+        self._update_horizon_errors(material_id, current_week=current_week)
+        
         horizon_error = self.get_horizon_error(material_id, lead_time)
         if horizon_error:
             print(f"\nHorizon {lead_time} hata metrikleri:")
