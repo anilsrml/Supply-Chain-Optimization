@@ -32,7 +32,7 @@ Tek hafta için planlama:
 python main/main.py --data "main/data.csv" --current-week 4 --lead-time 1 --current-stock 0 --model-size tiny
 ```
 
-## 📋 Parametre Açıklamaları
+##  Parametre Açıklamaları
 - `--data`: Kullanılacak veri dosyasının yolu (CSV)
 - `--current-week`: Planlamanın yapılacağı mevcut hafta
 - `--lead-time`: Tedarik süresi (hafta bazında)
