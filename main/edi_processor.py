@@ -366,7 +366,7 @@ class EDIProcessor:
             material_id: Malzeme ID
             current_week: Mevcut hafta
             target_week: Hedef hafta
-            lookback_weeks: Kaç hafta geriye bakılacak (None ise current_week kadar geri gider)
+            lookback_weeks: Kaç hafta geriye bakılacak (None ise lead_time kadar geri gider)
             method: Hesaplama yöntemi
                 - "simple": Basit ortalama
                 - "median": Medyan (aykırı değerlere karşı dayanıklı)
@@ -381,9 +381,9 @@ class EDIProcessor:
         if not material:
             return None
         
-        # lookback_weeks belirtilmemişse, current_week kadar geri git (tüm geçmiş)
+        # lookback_weeks belirtilmemişse, lead_time kadar geri git
         if lookback_weeks is None:
-            lookback_weeks = current_week
+            lookback_weeks = material.lead_time_weeks
         
         matrix = material.get_forecast_matrix()
         
@@ -477,7 +477,7 @@ class EDIProcessor:
         material_id: str,
         current_week: int,
         source: str,
-        lookback_weeks: int = 3,
+        lookback_weeks: Optional[int] = None,
         chronos_history: Optional[Dict[str, List[ChronosForecastLog]]] = None
     ) -> Optional[float]:
         """
@@ -487,18 +487,18 @@ class EDIProcessor:
         Target_week >= current_week olan tahminler degerlendirilemez.
         
         CHRONOS icin:
-            - Son 3 haftada (current_week - 3, current_week - 2, current_week - 1) yapilan tahminler
+            - Son lead_time haftada yapilan tahminler
             - Sadece target_week < current_week olan tahminler
         
         EDI icin:
-            - Son 3 haftanin gerceklesenleri (current_week - 3, current_week - 2, current_week - 1)
+            - Son lead_time haftanin gerceklesenleri
             - Her hafta icin o haftaya yapilan son 2 tahmin (horizon-1 ve horizon-2)
         
         Args:
             material_id: Malzeme ID
             current_week: Mevcut hafta
             source: "chronos" veya "edi"
-            lookback_weeks: Kac hafta geriye bakilacak
+            lookback_weeks: Kac hafta geriye bakilacak (None ise lead_time kullanilir)
             chronos_history: Chronos tahmin gecmisi (source="chronos" icin gerekli)
             
         Returns:
@@ -507,6 +507,10 @@ class EDIProcessor:
         material = self.materials.get(material_id)
         if not material:
             return None
+        
+        # lookback_weeks belirtilmemisse lead_time kullan
+        if lookback_weeks is None:
+            lookback_weeks = material.lead_time_weeks
         
         actuals = material.get_actuals_dict()
         errors = []

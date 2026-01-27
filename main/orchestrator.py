@@ -205,7 +205,9 @@ class StockPlanningOrchestrator:
         ÇALIŞMA MANTĞI:
         1. Geçmiş haftalar için geriye dönük tahminler üret (backfill)
         2. Sadece current_week'e kadar olan geçmiş veri kullanılır
-        3. Chronos gerçek zamanlı olarak tahmin yapar
+        3. Chronos gerçek zamanlı olarak iki tahmin üretir:
+           - JSON/performans geçmişi için: sadece +1 hafta (horizon=1)
+           - Karar/Hibrit için: lead time hedef haftası (horizon=lead_time)
         4. EDI tahminleri geçmişten toplanır
         5. Her iki kaynağın performansı değerlendirilir (backfill sayesinde yeterli veri)
         6. Performansa göre ağırlıklı hibrit tahmin oluşturulur
@@ -238,15 +240,21 @@ class StockPlanningOrchestrator:
         print(f"Lead time: {lead_time} hafta | Hedef hafta: {target_week}")
         
         # 3. İki tahmini de al
-        chronos_forecast = None
+        # - Chronos JSON kaydı (performans geçmişi) için SADECE horizon=1 tutulur.
+        # - Karar/Hibrit hesap için ise lead time hedef haftasıyla aynı hedefi temsil edecek şekilde
+        #   horizon=lead_time tahmini kullanılır.
+        chronos_forecast = None  # karar/hybrid için: current_week + lead_time
+        chronos_next_week_forecast = None  # sadece log/JSON için: current_week + 1
         edi_forecast = None
         
-        # Chronos tahmini - HER ZAMAN sadece 1 hafta sonrasini tahmin eder
+        # Chronos tahminleri
         if len(historical) >= 2:
-            # Chronos her zaman horizon=1 kullanir (lead_time'dan bagimsiz)
-            next_week_forecast = self.forecaster.forecast_single_week(historical, target_horizon=1)
-            chronos_forecast = next_week_forecast
-            print(f"Chronos tahmini (1 hafta sonrasi): {chronos_forecast:.2f}")
+
+            
+            # 3.b) Karar/Hibrit için lead time hedef haftası tahmini (horizon=lead_time)
+            if lead_time >= 1:
+                chronos_forecast = self.forecaster.forecast_single_week(historical, target_horizon=lead_time)
+                print(f"Chronos tahmini (lead time hedef hafta): {chronos_forecast:.2f}")
             
             # Chronos tahminini kaydet
             # Not: Chronos current_week+1 için tahmin yapar (horizon=1)
@@ -254,7 +262,7 @@ class StockPlanningOrchestrator:
                 material_id=material_id,
                 forecast_week=current_week,
                 target_week=current_week + 1,  # Chronos her zaman 1 hafta sonrasi
-                forecast_value=chronos_forecast
+                forecast_value=chronos_next_week_forecast
             )
             # Hafızayı güncelle
             self.chronos_history = self.edi_processor.load_chronos_forecasts()
