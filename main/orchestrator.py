@@ -250,20 +250,26 @@ class StockPlanningOrchestrator:
         # Chronos tahminleri
         if len(historical) >= 2:
 
+            # 3.a) Log/performans için +1 hafta tahmini (horizon=1)
+            chronos_next_week_forecast = self.forecaster.forecast_single_week(
+                historical, target_horizon=1
+            )
+
             
             # 3.b) Karar/Hibrit için lead time hedef haftası tahmini (horizon=lead_time)
-            if lead_time >= 1:
+            if lead_time >= 1:                          
                 chronos_forecast = self.forecaster.forecast_single_week(historical, target_horizon=lead_time)
                 print(f"Chronos tahmini (lead time hedef hafta): {chronos_forecast:.2f}")
             
             # Chronos tahminini kaydet
             # Not: Chronos current_week+1 için tahmin yapar (horizon=1)
-            self.edi_processor.save_chronos_forecast(
-                material_id=material_id,
-                forecast_week=current_week,
-                target_week=current_week + 1,  # Chronos her zaman 1 hafta sonrasi
-                forecast_value=chronos_next_week_forecast
-            )
+            if chronos_next_week_forecast is not None:
+                self.edi_processor.save_chronos_forecast(
+                    material_id=material_id,
+                    forecast_week=current_week,
+                    target_week=current_week + 1,  # Chronos her zaman 1 hafta sonrasi
+                    forecast_value=chronos_next_week_forecast
+                )
             # Hafızayı güncelle
             self.chronos_history = self.edi_processor.load_chronos_forecasts()
         else:

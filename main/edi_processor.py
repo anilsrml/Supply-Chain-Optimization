@@ -269,7 +269,7 @@ class EDIProcessor:
         material_id: str,
         forecast_week: int,
         target_week: int,
-        forecast_value: float,
+        forecast_value: Optional[float],
         filepath: str = "chronos_forecasts.json"
     ):
         """
@@ -282,6 +282,28 @@ class EDIProcessor:
             forecast_value: Tahmin değeri
             filepath: JSON dosya yolu
         """
+        # None / NaN gibi geçersiz değerleri kaydetme (sonradan RMSE hesaplarını bozar)
+        if forecast_value is None:
+            print(
+                f"UYARI [{material_id}]: Chronos tahmini None geldi (fw={forecast_week}, tw={target_week}). "
+                f"JSON'a kaydedilmiyor."
+            )
+            return
+        try:
+            forecast_value = float(forecast_value)
+        except (TypeError, ValueError):
+            print(
+                f"UYARI [{material_id}]: Chronos tahmini sayıya çevrilemedi (fw={forecast_week}, tw={target_week}). "
+                f"JSON'a kaydedilmiyor."
+            )
+            return
+        if np.isnan(forecast_value):
+            print(
+                f"UYARI [{material_id}]: Chronos tahmini NaN geldi (fw={forecast_week}, tw={target_week}). "
+                f"JSON'a kaydedilmiyor."
+            )
+            return
+
         # Mevcut verileri yükle
         data = {}
         if os.path.exists(filepath):
@@ -334,18 +356,57 @@ class EDIProcessor:
                 data = json.load(f)
             
             result = {}
+            invalid_found = False
             for material_id, logs in data.items():
-                result[material_id] = [
-                    ChronosForecastLog(
-                        material_id=material_id,
-                        forecast_week=log['forecast_week'],
-                        target_week=log['target_week'],
-                        forecast_value=log['forecast_value'],
-                        timestamp=log.get('timestamp', '')
+                cleaned_logs: List[ChronosForecastLog] = []
+                for log in logs:
+                    fv = log.get('forecast_value', None)
+                    if fv is None:
+                        invalid_found = True
+                        continue
+                    try:
+                        fv = float(fv)
+                    except (TypeError, ValueError):
+                        invalid_found = True
+                        continue
+                    if np.isnan(fv):
+                        invalid_found = True
+                        continue
+
+                    cleaned_logs.append(
+                        ChronosForecastLog(
+                            material_id=material_id,
+                            forecast_week=log['forecast_week'],
+                            target_week=log['target_week'],
+                            forecast_value=fv,
+                            timestamp=log.get('timestamp', '')
+                        )
                     )
-                    for log in logs
-                ]
+
+                if cleaned_logs:
+                    result[material_id] = cleaned_logs
             
+            # İsteğe bağlı otomatik temizlik: bozuk kayıtlar varsa dosyayı yeniden yaz
+            # (Bu sayede bir sonraki çalıştırmada da aynı problem tekrarlanmaz.)
+            if invalid_found:
+                try:
+                    serializable = {}
+                    for mid, logs in result.items():
+                        serializable[mid] = [
+                            {
+                                "forecast_week": l.forecast_week,
+                                "target_week": l.target_week,
+                                "forecast_value": l.forecast_value,
+                                "timestamp": l.timestamp,
+                            }
+                            for l in logs
+                        ]
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        json.dump(serializable, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    # Temizlik yazımı başarısız olursa ana akışı bozma
+                    pass
+
             return result
         except:
             return {}
@@ -413,11 +474,12 @@ class EDIProcessor:
         
         # Aykırı değer temizleme (IQR yöntemi)
         if method in ["iqr_mean", "iqr_median"]:
+            original_forecasts = list(forecasts)
             forecasts = self._remove_outliers_iqr(forecasts)
             
             # Temizleme sonrası veri kalmadıysa, orijinal verinin medyanını kullan
             if not forecasts:
-                return float(np.median(forecasts))
+                return float(np.median(original_forecasts))
         
         # Hesaplama yöntemi seçimi
         if method in ["median", "iqr_median"]:
@@ -538,6 +600,9 @@ class EDIProcessor:
                                    if log.target_week == target_week and log.forecast_week < target_week]
                 
                 for log in target_forecasts:
+                    # Bozuk/eksik kayıtları atla
+                    if log.forecast_value is None:
+                        continue
                     # SIFIR MASKELEME: Tahmin sıfırsa atla
                     if log.forecast_value == 0:
                         continue
