@@ -34,9 +34,7 @@ class MaterialData:
     """Malzeme verisi"""
     material_id: str
     lead_time_weeks: int  # Tedarik süresi (hafta)
-    current_stock: float  # Mevcut stok seviyesi
-    service_level: float = 0.95  # Servis seviyesi (varsayılan %95)
-    
+
     # EDI tahminleri ve gerçekleşen tüketimler
     edi_forecasts: List[EDIForecast] = field(default_factory=list)
     actual_consumptions: List[ActualConsumption] = field(default_factory=list)
@@ -94,21 +92,8 @@ class StockDecision:
     raw_forecast: float  # Ham Chronos tahmini
     bias_corrected_forecast: float  # Bias düzeltilmiş tahmin
     
-    # Stok hesaplamaları
-    safety_stock: float
-    reorder_point: float
-    
-    # Mevcut durum
-    current_stock: float
-    
-    # Karar
-    should_order: bool
-    recommended_order_qty: float
-    
     # Metrikler
     horizon_error: Optional[HorizonError] = None
-    service_level: float = 0.95
-    z_score: float = 1.645  # %95 için varsayılan Z değeri
     actual_target_week: Optional[float] = None  # Hedef haftanın gerçek değeri (eğer varsa)
     
     # Hibrit sistem bilgileri
@@ -117,27 +102,21 @@ class StockDecision:
     edi_raw_forecast: Optional[float] = None  # EDI'nin ham tahmini
     
     def __str__(self) -> str:
-        status = "SİPARİŞ VER" if self.should_order else "SİPARİŞ YOK"
-        
         # Hedef hafta bilgisi
         target_week_info = f"Lead Time Hedef Hafta: {self.lead_time_week}"
         if self.actual_target_week is not None:
             target_week_info += f" | Gerçek Değer: {self.actual_target_week:.2f}"
         else:
             target_week_info += " | Gerçek Değer: Henüz Bilinmiyor"
-        
+
         # Kaynak bilgisi
         source_info = f"Seçilen Kaynak: {self.selected_source}"
         if self.chronos_raw_forecast is not None and self.edi_raw_forecast is not None:
             source_info += f" | Chronos: {self.chronos_raw_forecast:.2f}, EDI: {self.edi_raw_forecast:.2f}"
-        
+
         return (
             f"Malzeme: {self.material_id} | Hafta: {self.current_week}\n"
             f"{target_week_info}\n"
             f"{source_info}\n"
-            f"Ham Tahmin: {self.raw_forecast:.2f} | Düzeltilmiş: {self.bias_corrected_forecast:.2f}\n"
-            f"Emniyet Stoğu: {self.safety_stock:.2f}\n"
-            f"Reorder Point: {self.reorder_point:.2f}\n"
-            f"Mevcut Stok: {self.current_stock:.2f}\n"
-            f"Karar: {status}" + (f" | Sipariş Miktarı: {self.recommended_order_qty:.2f}" if self.should_order else "")
+            f"Ham Tahmin: {self.raw_forecast:.2f} | Düzeltilmiş: {self.bias_corrected_forecast:.2f}"
         )

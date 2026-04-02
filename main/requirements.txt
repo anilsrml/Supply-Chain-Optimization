@@ -5,4 +5,5 @@ chronos-forecasting[training]
 torch
 numpy
 pandas
+openpyxl
 scipy

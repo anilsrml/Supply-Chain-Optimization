@@ -23,46 +23,52 @@ class StockPlanningOrchestrator:
     3. Her iki kaynağın performansını değerlendir (son 3 hafta RMSE)
     4. Hibrit tahmin oluştur (performansa göre ağırlıklı ortalama)
     5. Horizon bazlı bias düzeltmesi uygula
-    6. Emniyet stoğu ve reorder point hesapla
-    7. Sipariş kararı ver
     
     ÖNEMLİ: Sadece mevcut haftaya kadar olan geçmiş veri kullanılır.
     Gelecek bilgisi sızması (look-ahead bias) engellenir.
     """
     
-    def __init__(self, chronos_model_size: str = "tiny"):
+    def __init__(self, chronos_model_size: str = "bolt-base", use_column_forecast: bool = False):
         """
         Orkestratörü başlatır.
-        
+
         Args:
             chronos_model_size: Chronos model boyutu
+            use_column_forecast: True ise Chronos lead-time tahmini için
+                EDI sütun yakınsama serisini kullanır (varsayılan: kapalı)
         """
         self.forecaster = ChronosForecaster(model_size=chronos_model_size)
         self.edi_processor = EDIProcessor()
         self.stock_calculator = StockCalculator()
-        
+        self.use_column_forecast = use_column_forecast
+
         # Horizon bazlı hata cache'i
         self.horizon_errors: Dict[str, Dict[int, HorizonError]] = {}
-        
+
         # Chronos tahmin geçmişini yükle
         # Not: Bu geçmiş, gerçek zamanlı yapılan tahminlerin kayıtlarını içerir
         # Performans karşılaştırması için kullanılır
         self.chronos_history = self.edi_processor.load_chronos_forecasts()
-        
-        print("Stok Planlama Sistemi başlatıldı (Gerçek Zamanlı Chronos - Hibrit Mod).")
+
+        mode_label = "Column Forecast" if use_column_forecast else "Standard (Actuals)"
+        print(f"Stok Planlama Sistemi baslatildi (Gercek Zamanli Chronos - Hibrit Mod, Chronos Girdi: {mode_label}).")
     
     def load_material_data(
         self,
         filepath: str,
         material_id: str,
         lead_time_weeks: int,
-        current_stock: float,
-        service_level: float = 0.95
     ) -> MaterialData:
-        """EDI verilerini yükler"""
-        material = self.edi_processor.load_from_csv(
-            filepath, material_id, lead_time_weeks, current_stock, service_level
-        )
+        """EDI verilerini yükler (.xlsx/.xls → Excel, aksi halde CSV)."""
+        lower = filepath.lower()
+        if lower.endswith((".xlsx", ".xls")):
+            material = self.edi_processor.load_from_excel(
+                filepath, material_id, lead_time_weeks
+            )
+        else:
+            material = self.edi_processor.load_from_csv(
+                filepath, material_id, lead_time_weeks
+            )
         
         # Horizon hatalarını hesapla
         self._update_horizon_errors(material_id)
@@ -247,19 +253,42 @@ class StockPlanningOrchestrator:
         chronos_next_week_forecast = None  # sadece log/JSON için: current_week + 1
         edi_forecast = None
         
+        # Column forecast modu takibi
+        used_column_data = False
+
         # Chronos tahminleri
         if len(historical) >= 2:
 
-            # 3.a) Log/performans için +1 hafta tahmini (horizon=1)
+            # 3.a) Log/performans için +1 hafta tahmini (horizon=1) — her zaman actuals
             chronos_next_week_forecast = self.forecaster.forecast_single_week(
                 historical, target_horizon=1
             )
 
-            
-            # 3.b) Karar/Hibrit için lead time hedef haftası tahmini (horizon=lead_time)
-            if lead_time >= 1:                          
-                chronos_forecast = self.forecaster.forecast_single_week(historical, target_horizon=lead_time)
-                print(f"Chronos tahmini (lead time hedef hafta): {chronos_forecast:.2f}")
+            # 3.b) Karar/Hibrit için lead time hedef haftası tahmini
+            if lead_time >= 1:
+                if self.use_column_forecast:
+                    # Column forecast: hedef haftanın EDI sütun yakınsama serisini kullan
+                    column_data = self.edi_processor.get_target_week_column(
+                        material_id, target_week, up_to_week=current_week
+                    )
+                    if len(column_data) >= 2:
+                        chronos_forecast = self.forecaster.forecast_single_week(
+                            column_data, target_horizon=1
+                        )
+                        used_column_data = True
+                        print(f"Chronos tahmini (column forecast, {len(column_data)} veri noktasi): {chronos_forecast:.2f}")
+                    else:
+                        # Yetersiz sütun verisi — standart moda fallback
+                        print(f"Column forecast icin yetersiz veri ({len(column_data)} nokta), standart moda donuluyor")
+                        chronos_forecast = self.forecaster.forecast_single_week(
+                            historical, target_horizon=lead_time
+                        )
+                        print(f"Chronos tahmini (fallback, lead time hedef hafta): {chronos_forecast:.2f}")
+                else:
+                    chronos_forecast = self.forecaster.forecast_single_week(
+                        historical, target_horizon=lead_time
+                    )
+                    print(f"Chronos tahmini (lead time hedef hafta): {chronos_forecast:.2f}")
             
             # Chronos tahminini kaydet
             # Not: Chronos current_week+1 için tahmin yapar (horizon=1)
@@ -365,6 +394,12 @@ class StockPlanningOrchestrator:
         )
         
         # Hibrit sistem bilgilerini ekle
+        # Column forecast kullanıldıysa kaynak etiketini güncelle
+        if used_column_data:
+            if selected_source == "CHRONOS":
+                selected_source = "CHRONOS_COLUMN"
+            elif selected_source == "HYBRID":
+                selected_source = "HYBRID_COLUMN"
         decision.selected_source = selected_source
         decision.chronos_raw_forecast = chronos_forecast
         decision.edi_raw_forecast = edi_forecast
@@ -379,66 +414,39 @@ class StockPlanningOrchestrator:
         material_id: str,
         start_week: int,
         end_week: int,
-        initial_stock: float
     ) -> List[StockDecision]:
         """
         Belirli bir dönem için simülasyon çalıştırır.
-        
+
         Args:
             material_id: Malzeme ID
             start_week: Başlangıç haftası
             end_week: Bitiş haftası
-            initial_stock: Başlangıç stok seviyesi
-            
+
         Returns:
             Her hafta için stok kararları listesi
         """
         material = self.edi_processor.materials.get(material_id)
         if not material:
             raise ValueError(f"Malzeme bulunamadı: {material_id}")
-        
+
         decisions = []
-        current_stock = initial_stock
-        actuals = material.get_actuals_dict()
-        
+
         print(f"\n{'#'*60}")
         print(f"SİMÜLASYON BAŞLATILIYOR")
         print(f"Malzeme: {material_id}")
         print(f"Dönem: Hafta {start_week} - {end_week}")
-        print(f"Başlangıç Stok: {initial_stock:.2f}")
         print(f"{'#'*60}")
-        
+
         for week in range(start_week, end_week + 1):
-            # Mevcut stoku güncelle
-            material.current_stock = current_stock
-            
-            # Haftalık planlama
             decision = self.run_weekly_planning(material_id, week)
             decisions.append(decision)
-            
-            # Stok güncellemesi (simülasyon için)
-            # Sipariş verdiyse, lead time sonra gelecek (şimdilik basitleştirilmiş)
-            actual_consumption = actuals.get(week, 0)
-            current_stock = max(0, current_stock - actual_consumption)
-            
-            # Sipariş geldiyse ekle (basitleştirilmiş: anında geliyor)
-            if decision.should_order:
-                current_stock += decision.recommended_order_qty
-            
-            print(f"Hafta {week} sonu stok: {current_stock:.2f}")
-        
-        # Özet
+
         print(f"\n{'#'*60}")
         print("SİMÜLASYON ÖZETİ")
         print(f"{'#'*60}")
-        
-        total_orders = sum(1 for d in decisions if d.should_order)
-        total_qty = sum(d.recommended_order_qty for d in decisions)
-        
-        print(f"Toplam sipariş sayısı: {total_orders}")
-        print(f"Toplam sipariş miktarı: {total_qty:.2f}")
-        print(f"Final stok seviyesi: {current_stock:.2f}")
-        
+        print(f"Toplam hafta sayısı: {len(decisions)}")
+
         return decisions
     
     def get_summary_report(
@@ -456,13 +464,8 @@ class StockPlanningOrchestrator:
                 'start_week': decisions[0].current_week,
                 'end_week': decisions[-1].current_week
             },
-            'orders': {
-                'count': sum(1 for d in decisions if d.should_order),
-                'total_quantity': sum(d.recommended_order_qty for d in decisions)
+            'forecast': {
+                'avg_raw': np.mean([d.raw_forecast for d in decisions]),
+                'avg_corrected': np.mean([d.bias_corrected_forecast for d in decisions]),
             },
-            'inventory': {
-                'avg_safety_stock': np.mean([d.safety_stock for d in decisions]),
-                'avg_reorder_point': np.mean([d.reorder_point for d in decisions])
-            },
-            'service_level': decisions[0].service_level
         }

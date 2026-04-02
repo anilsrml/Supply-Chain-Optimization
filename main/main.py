@@ -4,7 +4,13 @@ Ana giriş noktası
 """
 
 import os
-from orchestrator import StockPlanningOrchestrator
+import sys
+from pathlib import Path
+
+
+def _default_data_path() -> str:
+    """Proje kökü (stok_projesi) altındaki data_safety_stock.xlsx."""
+    return str(Path(__file__).resolve().parents[2] / "data_safety_stock.xlsx")
 
 
 # GERÇEK ZAMANLI CHRONOS TAHMİNİ
@@ -27,7 +33,7 @@ def main():
        - Satırlar: Tahmin yapılan hafta
        - Sütunlar: Hedef hafta
        - Üst üçgen: Tahminler
-       - Diagonal: Gerçekleşen değerler
+       - Köşegenin hemen altı (fw=tw+1): Gerçekleşen değerler
     
     2. Orchestrator'ı başlatın:
        orchestrator = StockPlanningOrchestrator()
@@ -37,8 +43,6 @@ def main():
            filepath='veri.csv',
            material_id='MAL001',
            lead_time_weeks=4,
-           current_stock=100,
-           service_level=0.95
        )
     
     4. Haftalık planlama yapın:
@@ -53,15 +57,18 @@ def main():
     parser.add_argument(
         '--data',
         type=str,
-        required=True,
-        help='EDI veri dosyası yolu (CSV)'
+        default=None,
+        help=(
+            'EDI veri dosyası (.xlsx data_safety_stock veya CSV). '
+            'Verilmezse: proje kökünde data_safety_stock.xlsx kullanılır.'
+        ),
     )
-    
+
     parser.add_argument(
         '--material-id',
         type=str,
-        default='MAT001',
-        help='Malzeme ID (varsayılan: MAT001)'
+        required=True,
+        help='Materyal kodu (Excel: Material - Key; örn. M100F133RO)',
     )
     
     parser.add_argument(
@@ -69,20 +76,6 @@ def main():
         type=int,
         default=4,
         help='Lead time hafta sayısı (varsayılan: 4)'
-    )
-    
-    parser.add_argument(
-        '--current-stock',
-        type=float,
-        default=100,
-        help='Mevcut stok seviyesi (varsayılan: 100)'
-    )
-    
-    parser.add_argument(
-        '--service-level',
-        type=float,
-        default=0.95,
-        help='Hedef servis seviyesi (varsayılan: 0.95)'
     )
     
     parser.add_argument(
@@ -95,13 +88,36 @@ def main():
     parser.add_argument(
         '--model-size',
         type=str,
-        default='tiny',
-        choices=['tiny', 'mini', 'small', 'base', 'large'],
-        help='Chronos model boyutu (varsayılan: tiny)'
+        default='bolt-base',
+        choices=['bolt-tiny', 'bolt-mini', 'bolt-small', 'bolt-base', 'tiny', 'mini', 'small', 'base', 'large'],
+        help='Chronos model boyutu (varsayılan: bolt-base)'
     )
-    
+
+    parser.add_argument(
+        '--use-column-forecast',
+        action='store_true',
+        default=False,
+        help='Chronos tahmininde EDI sutun yakinsama serisini kullan (varsayilan: kapali)'
+    )
+
     args = parser.parse_args()
-    
+
+    data_path = args.data if args.data else _default_data_path()
+    if not os.path.isfile(data_path):
+        print(f"HATA: Veri dosyası bulunamadı: {data_path}")
+        sys.exit(1)
+
+    if str(data_path).lower().endswith((".xlsx", ".xls")):
+        from excel_data_loader import ExcelDataLoader
+
+        try:
+            ExcelDataLoader.validate_material_code(data_path, args.material_id)
+        except ValueError as e:
+            print(str(e))
+            sys.exit(2)
+
+    from orchestrator import StockPlanningOrchestrator
+
     # Gerçek zamanlı Chronos tahmini - sistem her hafta için dinamik olarak tahmin yapar
     print("\n" + "="*60)
     print("GERCEK ZAMANLI CHRONOS TAHMIN SISTEMI")
@@ -110,19 +126,23 @@ def main():
     print("[+] Her hafta sadece geçmiş veri kullanılır")
     print("[+] Look-ahead bias engellenir")
     print("="*60)
-    
-    # Veri ile çalıştır
+
     print("\nSistem başlatılıyor...")
-    orchestrator = StockPlanningOrchestrator(chronos_model_size=args.model_size)
-    
-    print(f"Veri yükleniyor: {args.data}")
-    orchestrator.load_material_data(
-        filepath=args.data,
-        material_id=args.material_id,
-        lead_time_weeks=args.lead_time,
-        current_stock=args.current_stock,
-        service_level=args.service_level
+    orchestrator = StockPlanningOrchestrator(
+        chronos_model_size=args.model_size,
+        use_column_forecast=args.use_column_forecast
     )
+
+    print(f"Veri yükleniyor: {data_path}")
+    try:
+        orchestrator.load_material_data(
+            filepath=data_path,
+            material_id=args.material_id,
+            lead_time_weeks=args.lead_time,
+        )
+    except ValueError as e:
+        print(str(e))
+        sys.exit(2)
     
     print(f"\nHafta {args.current_week} için planlama yapılıyor...")
     decision = orchestrator.run_weekly_planning(

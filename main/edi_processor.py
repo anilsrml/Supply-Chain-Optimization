@@ -11,6 +11,12 @@ from typing import Dict, List, Optional, Tuple
 from models import EDIForecast, ActualConsumption, MaterialData, ChronosForecastLog
 
 
+def _load_excel_edi_dataframe(filepath: str, material_id: str):
+    from excel_data_loader import ExcelDataLoader
+
+    return ExcelDataLoader.build_edi_dataframe(filepath, material_id)
+
+
 class EDIProcessor:
     """EDI tahmin verilerini işleyen sınıf"""
     
@@ -22,24 +28,21 @@ class EDIProcessor:
         df: pd.DataFrame,
         material_id: str,
         lead_time_weeks: int,
-        current_stock: float,
-        service_level: float = 0.95
     ) -> MaterialData:
         """
         DataFrame'den EDI verilerini yükler.
-        
-        DataFrame formatı (üst üçgen matris):
+
+        DataFrame formatı:
         - Satırlar: Tahmin yapılan hafta (forecast_week)
-        - Sütunlar: Tahmin edilen hafta (target_week) 
-        - Değerler: Tahmin miktarları
-        - Alt üçgen: Gerçekleşen değerler (actual)
-        
+        - Sütunlar: Tahmin edilen hafta (target_week)
+        - Üst üçgen (tw > fw): EDI tahminleri
+        - Köşegenin bir altı (fw == tw + 1): Gerçekleşen tüketim (hafta = tw)
+        - Köşegen (tw == fw): Bu akışta gerçekleşen sayılmaz (yoksayılır)
+
         Args:
             df: EDI tahmin matrisi DataFrame
             material_id: Malzeme ID
             lead_time_weeks: Tedarik süresi
-            current_stock: Mevcut stok
-            service_level: Servis seviyesi
         """
         edi_forecasts = []
         actual_consumptions = []
@@ -69,8 +72,8 @@ class EDIProcessor:
                             target_week=tw,
                             quantity=float(value)
                         ))
-                    # Diagonal: Gerçekleşen değerler
-                    elif tw == fw:
+                    # Köşegenin hemen altı (aynı hedef hafta sütunu, bir sonraki tahmin satırı): gerçekleşen
+                    elif fw == tw + 1:
                         actual_consumptions.append(ActualConsumption(
                             week=tw,
                             quantity=float(value)
@@ -85,8 +88,6 @@ class EDIProcessor:
         material = MaterialData(
             material_id=material_id,
             lead_time_weeks=lead_time_weeks,
-            current_stock=current_stock,
-            service_level=service_level,
             edi_forecasts=edi_forecasts,
             actual_consumptions=actual_consumptions
         )
@@ -99,14 +100,20 @@ class EDIProcessor:
         filepath: str,
         material_id: str,
         lead_time_weeks: int,
-        current_stock: float,
-        service_level: float = 0.95
     ) -> MaterialData:
         """CSV dosyasından EDI verilerini yükler"""
         df = pd.read_csv(filepath, index_col=0)
-        return self.load_from_dataframe(
-            df, material_id, lead_time_weeks, current_stock, service_level
-        )
+        return self.load_from_dataframe(df, material_id, lead_time_weeks)
+
+    def load_from_excel(
+        self,
+        filepath: str,
+        material_id: str,
+        lead_time_weeks: int,
+    ) -> MaterialData:
+        """data_safety_stock.xlsx tipi Excel dosyasından EDI matrisi yükler (sonra load_from_dataframe)."""
+        df = _load_excel_edi_dataframe(filepath, material_id)
+        return self.load_from_dataframe(df, material_id, lead_time_weeks)
     
     def get_historical_series(
         self,
@@ -146,6 +153,53 @@ class EDIProcessor:
         sorted_weeks = sorted(actuals.keys())
         return [actuals[w] for w in sorted_weeks]
     
+    def get_target_week_column(
+        self,
+        material_id: str,
+        target_week: int,
+        up_to_week: int,
+        exclude_zeros: bool = True
+    ) -> List[float]:
+        """
+        Hedef haftanın sütun verisini döner: o haftaya yapılmış EDI tahminleri.
+
+        EDI matrisinde target_week sütunundaki değerleri fw=1..up_to_week
+        arasında kronolojik sırayla toplar. Chronos'a girdi olarak
+        tahminlerin yakınsama trendini verir.
+
+        Args:
+            material_id: Malzeme ID
+            target_week: Hedef hafta (sütun)
+            up_to_week: Bu haftaya kadar olan tahminler (dahil)
+            exclude_zeros: True ise sıfır değerler maskelenir
+
+        Returns:
+            Kronolojik sırayla tahmin listesi (boşluklar/sıfırlar hariç)
+        """
+        material = self.materials.get(material_id)
+        if not material:
+            raise ValueError(f"Malzeme bulunamadı: {material_id}")
+
+        matrix = material.get_forecast_matrix()
+
+        values = []
+        zero_count = 0
+        for fw in range(1, up_to_week + 1):
+            if fw in matrix and target_week in matrix[fw]:
+                value = matrix[fw][target_week]
+                if exclude_zeros and value == 0:
+                    zero_count += 1
+                    continue
+                values.append(value)
+
+        if zero_count > 0:
+            print(
+                f"UYARI [{material_id}]: Hedef hafta {target_week} sütununda "
+                f"{zero_count} adet sıfır değer maskelendi."
+            )
+
+        return values
+
     def get_forecast_for_horizon(
         self,
         material_id: str,
@@ -417,37 +471,30 @@ class EDIProcessor:
         current_week: int,
         target_week: int,
         lookback_weeks: Optional[int] = None,
-        method: str = "iqr_mean",
-        use_weighted: bool = False
     ) -> Optional[float]:
         """
         Hedef hafta için geçmişte yapılmış EDI tahminlerinin ortalamasını döner.
-        
+        Yöntem: IQR ile aykırı değerleri temizle, sonra aritmetik ortalama al.
+
         Args:
             material_id: Malzeme ID
             current_week: Mevcut hafta
             target_week: Hedef hafta
             lookback_weeks: Kaç hafta geriye bakılacak (None ise lead_time kadar geri gider)
-            method: Hesaplama yöntemi
-                - "simple": Basit ortalama
-                - "median": Medyan (aykırı değerlere karşı dayanıklı)
-                - "iqr_mean": IQR ile aykırı değerleri temizle, sonra ortalama (varsayılan)
-                - "iqr_median": IQR ile aykırı değerleri temizle, sonra medyan
-            use_weighted: True ise son tahminlere daha fazla ağırlık verir
-            
+
         Returns:
             EDI tahminlerinin hesaplanmış değeri (veya None)
         """
         material = self.materials.get(material_id)
         if not material:
             return None
-        
+
         # lookback_weeks belirtilmemişse, lead_time kadar geri git
         if lookback_weeks is None:
             lookback_weeks = material.lead_time_weeks
-        
+
         matrix = material.get_forecast_matrix()
-        
+
         # Geçmiş haftalardaki tahminleri topla (Hafta 1'den current_week'e kadar)
         forecasts = []
         zero_count = 0
@@ -459,7 +506,7 @@ class EDIProcessor:
                     zero_count += 1
                     continue
                 forecasts.append(value)
-        
+
         if not forecasts:
             # Hiç tahmin yoksa, en son bulunan tahmini kullan (sıfır olmayanlardan)
             for week in range(current_week, 0, -1):
@@ -471,27 +518,15 @@ class EDIProcessor:
             if zero_count > 0:
                 print(f"UYARI [{material_id}]: Hedef hafta {target_week} için tüm EDI tahminleri sıfır. 'Veri Yok' döndürülüyor.")
             return None
-        
-        # Aykırı değer temizleme (IQR yöntemi)
-        if method in ["iqr_mean", "iqr_median"]:
-            original_forecasts = list(forecasts)
-            forecasts = self._remove_outliers_iqr(forecasts)
-            
-            # Temizleme sonrası veri kalmadıysa, orijinal verinin medyanını kullan
-            if not forecasts:
-                return float(np.median(original_forecasts))
-        
-        # Hesaplama yöntemi seçimi
-        if method in ["median", "iqr_median"]:
-            return float(np.median(forecasts))
-        
-        # Ortalama hesaplama (weighted veya simple)
-        if use_weighted and len(forecasts) > 1:
-            # Son tahminlere doğru lineer artan ağırlık
-            weights = np.arange(1, len(forecasts) + 1)
-            return float(np.average(forecasts, weights=weights))
-        
-        # Basit ortalama (varsayılan)
+
+        # IQR ile aykırı değerleri temizle, ardından aritmetik ortalama al
+        original_forecasts = list(forecasts)
+        forecasts = self._remove_outliers_iqr(forecasts)
+
+        # Temizleme sonrası veri kalmadıysa, orijinal verinin medyanını kullan
+        if not forecasts:
+            return float(np.median(original_forecasts))
+
         return float(np.mean(forecasts))
     
     def _remove_outliers_iqr(

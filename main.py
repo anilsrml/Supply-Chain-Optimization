@@ -35,6 +35,13 @@ def _rewrite_data_arg_if_needed(repo_root: str) -> None:
     candidate = os.path.join(repo_root, "main", data_path)
     if os.path.exists(candidate):
         argv[i + 1] = candidate
+        return
+
+    # `data_safety_stock.xlsx` gibi dosyalar repo üstünde (stok_projesi/) olabilir
+    parent_root = os.path.dirname(repo_root)
+    candidate_parent = os.path.join(parent_root, data_path)
+    if os.path.exists(candidate_parent):
+        argv[i + 1] = candidate_parent
 
 
 def main() -> None:
